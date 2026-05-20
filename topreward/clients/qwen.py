@@ -282,16 +282,14 @@ class QwenClient(BaseModelClient):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build one temporary padded video block for prefixes with an incomplete merge group."""
         merge_size = self.processor.video_processor.merge_size
-        padded_raw_frame_indices = list(raw_frame_indices)
-        if len(padded_raw_frame_indices) % merge_size != 0:
-            padded_raw_frame_indices.extend([padded_raw_frame_indices[-1]] * (merge_size - len(padded_raw_frame_indices) % merge_size))
+        padded_raw_frame_indices = self._pad_frame_indices_to_merge_group(raw_frame_indices, merge_size)
         partial_frames = [to_pil(cast(ImageT, frames[idx])) for idx in padded_raw_frame_indices]
         video_tensor = torch.stack(
             [torch.from_numpy(np.array(frame.convert("RGB")).transpose(2, 0, 1)) for frame in partial_frames]
         )
         video_metadata = {
             "fps": fps,
-            "frames_indices": raw_frame_indices,
+            "frames_indices": padded_raw_frame_indices,
             "total_num_frames": raw_total_frames,
         }
         processed = self.processor.video_processor(
@@ -305,7 +303,7 @@ class QwenClient(BaseModelClient):
         video_grid_thw = processed["video_grid_thw"].to("cuda")
         merge_length = merge_size**2
         frame_seqlen = int(video_grid_thw[0][1:].prod().item() // merge_length)
-        timestamps = self.processor._calculate_timestamps(raw_frame_indices, fps, merge_size)
+        timestamps = self.processor._calculate_timestamps(padded_raw_frame_indices, fps, merge_size)
         block_text = ""
         for timestamp in timestamps:
             block_text += f"<{timestamp:.1f} seconds>"
@@ -323,6 +321,20 @@ class QwenClient(BaseModelClient):
         )
         block_position_ids = block_position_ids + base_start_position
         return block_input_ids, block_position_ids, pixel_values_videos, video_grid_thw
+
+    @staticmethod
+    def _pad_frame_indices_to_merge_group(raw_frame_indices: list[int], merge_size: int) -> list[int]:
+        """Pad a frame-index block so metadata, features, and token placeholders stay aligned."""
+        if merge_size <= 0:
+            raise ValueError(f"merge_size must be positive, got {merge_size}")
+        if not raw_frame_indices:
+            raise ValueError("raw_frame_indices must be non-empty")
+
+        padded_raw_frame_indices = list(raw_frame_indices)
+        remainder = len(padded_raw_frame_indices) % merge_size
+        if remainder:
+            padded_raw_frame_indices.extend([padded_raw_frame_indices[-1]] * (merge_size - remainder))
+        return padded_raw_frame_indices
 
     def _build_multimodal_segment(
         self,

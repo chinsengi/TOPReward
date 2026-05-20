@@ -49,3 +49,15 @@ def test_aligned_video_indices_keep_all_frames_when_raw_fps_is_low():
     indices = QwenClient._aligned_video_indices(total_frames=6, raw_fps=1.0)
 
     assert indices == list(range(6))
+
+
+def test_pad_frame_indices_to_merge_group_repeats_last_partial_frame():
+    indices = QwenClient._pad_frame_indices_to_merge_group([2, 5, 8], merge_size=2)
+
+    assert indices == [2, 5, 8, 8]
+
+
+def test_pad_frame_indices_to_merge_group_keeps_aligned_blocks_unchanged():
+    indices = QwenClient._pad_frame_indices_to_merge_group([2, 5, 8, 11], merge_size=2)
+
+    assert indices == [2, 5, 8, 11]
