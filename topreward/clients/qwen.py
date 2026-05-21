@@ -239,8 +239,10 @@ class QwenClient(BaseModelClient):
         attention_mask = inputs["attention_mask"].to("cuda")
         video_grid_thw = inputs["video_grid_thw"].to("cuda")
         pixel_values_videos = inputs["pixel_values_videos"].to("cuda")
+        mm_token_type_ids = inputs["mm_token_type_ids"].to("cuda")
         position_ids, _ = self.model.model.get_rope_index(
             input_ids=input_ids,
+            mm_token_type_ids=mm_token_type_ids,
             video_grid_thw=video_grid_thw,
             attention_mask=attention_mask,
         )
@@ -314,8 +316,12 @@ class QwenClient(BaseModelClient):
             return_tensors="pt",
         )["input_ids"].to("cuda")
         block_attention_mask = torch.ones_like(block_input_ids)
+        # Video-only block: mark video_pad tokens as type 2 (video), rest as 0 (text).
+        # Equivalent to create_mm_token_type_ids but stays on GPU (no CPU round-trip).
+        block_mm_token_type_ids = (block_input_ids == self.processor.video_token_id).int() * 2
         block_position_ids, _ = self.model.model.get_rope_index(
             input_ids=block_input_ids,
+            mm_token_type_ids=block_mm_token_type_ids,
             video_grid_thw=video_grid_thw,
             attention_mask=block_attention_mask,
         )
@@ -348,11 +354,14 @@ class QwenClient(BaseModelClient):
         deepstack_visual_embeds = None
 
         if pixel_values_videos is not None:
-            video_embeds, deepstack_video_embeds = self.model.model.get_video_features(
+            video_result = self.model.model.get_video_features(
                 pixel_values_videos,
                 video_grid_thw,
             )
-            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            # pooler_output contains merged embeddings (split per video), matching placeholder token count.
+            # deepstack_features contains the deepstack visual embeddings (Qwen3-VL only; absent in Qwen3.5).
+            video_embeds = torch.cat(video_result.pooler_output, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            deepstack_video_embeds = getattr(video_result, "deepstack_features", None)
             video_mask_1d = input_ids == self.model.config.video_token_id
             video_mask = video_mask_1d.unsqueeze(-1).expand_as(inputs_embeds)
             if inputs_embeds[video_mask].numel() != video_embeds.numel():
@@ -362,7 +371,8 @@ class QwenClient(BaseModelClient):
                 )
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
             visual_pos_masks = video_mask_1d.to(inputs_embeds.device)
-            deepstack_visual_embeds = [embed.to(inputs_embeds.device, inputs_embeds.dtype) for embed in deepstack_video_embeds]
+            if deepstack_video_embeds is not None:
+                deepstack_visual_embeds = [embed.to(inputs_embeds.device, inputs_embeds.dtype) for embed in deepstack_video_embeds]
 
         return inputs_embeds, visual_pos_masks, deepstack_visual_embeds
 
@@ -387,7 +397,7 @@ class QwenClient(BaseModelClient):
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
         prefer_eager: bool = False,
     ):
-        original_attn_impl = self.model.language_model.config._attn_implementation
+        original_attn_impl = self.model.model.language_model.config._attn_implementation
         packed_position_ids = position_ids
         if original_attn_impl == "flash_attention_2":
             packed_position_ids = self._with_flash_packed_text_position_ids(position_ids)
@@ -395,7 +405,7 @@ class QwenClient(BaseModelClient):
 
         def _run():
             with torch.no_grad():
-                return self.model.language_model(
+                return self.model.model.language_model(
                     input_ids=None,
                     inputs_embeds=inputs_embeds,
                     position_ids=packed_position_ids,
@@ -411,24 +421,24 @@ class QwenClient(BaseModelClient):
             return "out of memory" in str(exc).lower()
 
         if prefer_eager:
-            self.model.language_model.config._attn_implementation = "eager"
+            self.model.model.language_model.config._attn_implementation = "eager"
             try:
                 return _run()
             finally:
-                self.model.language_model.config._attn_implementation = original_attn_impl
+                self.model.model.language_model.config._attn_implementation = original_attn_impl
 
         try:
-            self.model.language_model.config._attn_implementation = original_attn_impl
+            self.model.model.language_model.config._attn_implementation = original_attn_impl
             return _run()
         except (RuntimeError, ValueError) as exc:
             if _is_oom(exc) or original_attn_impl == "eager":
                 raise
             logger.debug(f"Falling back to eager attention for cached Qwen LM forward: {exc}")
-            self.model.language_model.config._attn_implementation = "eager"
+            self.model.model.language_model.config._attn_implementation = "eager"
             try:
                 return _run()
             finally:
-                self.model.language_model.config._attn_implementation = original_attn_impl
+                self.model.model.language_model.config._attn_implementation = original_attn_impl
 
     def _compute_instruction_reward_with_cached_append(
         self,
